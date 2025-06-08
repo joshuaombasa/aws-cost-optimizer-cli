@@ -1,4 +1,4 @@
-# AWS Cost Killer
+# AWS Cost Optimizer
 
 This script uses AWS CLI to automatically delete all major billable resources in your AWS account, including:
 
