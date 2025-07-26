@@ -1,0 +1,179 @@
+use aws_config::meta::region::RegionProviderChain;
+use aws_sdk_ec2::Client as Ec2Client;
+use aws_sdk_s3::Client as S3Client;
+use aws_sdk_rds::Client as RdsClient;
+use aws_sdk_lambda::Client as LambdaClient;
+use aws_sdk_elb::Client as ElbClient;
+use std::error::Error;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    let region_provider = RegionProviderChain::default_provider().or_else("us-east-1");
+    let config = aws_config::from_env().region(region_provider).load().await;
+
+    let ec2 = Ec2Client::new(&config);
+    let s3 = S3Client::new(&config);
+    let rds = RdsClient::new(&config);
+    let lambda = LambdaClient::new(&config);
+    let elb = ElbClient::new(&config);
+
+    // EC2 Instances
+    println!("Deleting EC2 instances...");
+    let instances = ec2.describe_instances().send().await?;
+    let mut instance_ids = Vec::new();
+    for reservation in instances.reservations().unwrap_or(&[]) {
+        for instance in reservation.instances().unwrap_or(&[]) {
+            if let Some(id) = instance.instance_id() {
+                instance_ids.push(id.to_string());
+            }
+        }
+    }
+    if !instance_ids.is_empty() {
+        ec2.terminate_instances()
+            .set_instance_ids(Some(instance_ids))
+            .send()
+            .await?;
+    }
+
+    // Unattached EBS Volumes
+    println!("Deleting unattached EBS volumes...");
+    let volumes = ec2
+        .describe_volumes()
+        .filters(aws_sdk_ec2::types::Filter::builder()
+            .name("status")
+            .values("available")
+            .build())
+        .send()
+        .await?;
+    for vol in volumes.volumes().unwrap_or(&[]) {
+        if let Some(vol_id) = vol.volume_id() {
+            ec2.delete_volume().volume_id(vol_id).send().await?;
+        }
+    }
+
+    // Elastic IPs
+    println!("Releasing Elastic IPs...");
+    let addresses = ec2.describe_addresses().send().await?;
+    for addr in addresses.addresses().unwrap_or(&[]) {
+        if let Some(alloc_id) = addr.allocation_id() {
+            ec2.release_address().allocation_id(alloc_id).send().await?;
+        }
+    }
+
+    // S3 Buckets
+    println!("Deleting S3 buckets...");
+    let buckets = s3.list_buckets().send().await?;
+    for bucket in buckets.buckets().unwrap_or(&[]) {
+        if let Some(name) = bucket.name() {
+            // Delete objects first (for --force equivalent)
+            let objects = s3.list_objects_v2().bucket(name).send().await?;
+            if let Some(contents) = objects.contents() {
+                for obj in contents {
+                    if let Some(key) = obj.key() {
+                        s3.delete_object().bucket(name).key(key).send().await?;
+                    }
+                }
+            }
+            s3.delete_bucket().bucket(name).send().await?;
+        }
+    }
+
+    // RDS Instances
+    println!("Deleting RDS instances...");
+    let dbs = rds.describe_db_instances().send().await?;
+    for db in dbs.db_instances().unwrap_or(&[]) {
+        if let Some(id) = db.db_instance_identifier() {
+            rds.delete_db_instance()
+                .db_instance_identifier(id)
+                .skip_final_snapshot(true)
+                .delete_automated_backups(true)
+                .send()
+                .await?;
+        }
+    }
+
+    // Lambda Functions
+    println!("Deleting Lambda functions...");
+    let functions = lambda.list_functions().send().await?;
+    for func in functions.functions().unwrap_or(&[]) {
+        if let Some(name) = func.function_name() {
+            lambda.delete_function().function_name(name).send().await?;
+        }
+    }
+
+    // ELB Load Balancers
+    println!("Deleting Load Balancers...");
+    let lbs = elb.describe_load_balancers().send().await?;
+    for lb in lbs.load_balancer_descriptions().unwrap_or(&[]) {
+        if let Some(name) = lb.load_balancer_name() {
+            elb.delete_load_balancer().load_balancer_name(name).send().await?;
+        }
+    }
+
+    // VPCs (non-default)
+    println!("Deleting VPCs (except default)...");
+    let vpcs = ec2.describe_vpcs().send().await?;
+    for vpc in vpcs.vpcs().unwrap_or(&[]) {
+        if vpc.is_default().unwrap_or(false) {
+            continue;
+        }
+        let vpc_id = vpc.vpc_id().unwrap();
+
+        // Subnets
+        let subnets = ec2.describe_subnets()
+            .filters(aws_sdk_ec2::types::Filter::builder().name("vpc-id").values(vpc_id).build())
+            .send().await?;
+        for subnet in subnets.subnets().unwrap_or(&[]) {
+            if let Some(id) = subnet.subnet_id() {
+                ec2.delete_subnet().subnet_id(id).send().await?;
+            }
+        }
+
+        // Internet Gateways
+        let igws = ec2.describe_internet_gateways()
+            .filters(aws_sdk_ec2::types::Filter::builder().name("attachment.vpc-id").values(vpc_id).build())
+            .send().await?;
+        for igw in igws.internet_gateways().unwrap_or(&[]) {
+            if let Some(igw_id) = igw.internet_gateway_id() {
+                ec2.detach_internet_gateway()
+                    .internet_gateway_id(igw_id)
+                    .vpc_id(vpc_id)
+                    .send().await?;
+                ec2.delete_internet_gateway()
+                    .internet_gateway_id(igw_id)
+                    .send().await?;
+            }
+        }
+
+        // Route Tables
+        let rtables = ec2.describe_route_tables()
+            .filters(aws_sdk_ec2::types::Filter::builder().name("vpc-id").values(vpc_id).build())
+            .send().await?;
+        for rt in rtables.route_tables().unwrap_or(&[]) {
+            let is_main = rt.associations().unwrap_or(&[]).iter().any(|assoc| assoc.main().unwrap_or(false));
+            if !is_main {
+                if let Some(rt_id) = rt.route_table_id() {
+                    ec2.delete_route_table().route_table_id(rt_id).send().await?;
+                }
+            }
+        }
+
+        // Security Groups
+        let sgs = ec2.describe_security_groups()
+            .filters(aws_sdk_ec2::types::Filter::builder().name("vpc-id").values(vpc_id).build())
+            .send().await?;
+        for sg in sgs.security_groups().unwrap_or(&[]) {
+            if sg.group_name() != Some("default") {
+                if let Some(id) = sg.group_id() {
+                    ec2.delete_security_group().group_id(id).send().await?;
+                }
+            }
+        }
+
+        // Delete VPC
+        ec2.delete_vpc().vpc_id(vpc_id).send().await?;
+    }
+
+    println!("✅ All major billable AWS resources have been deleted.");
+    Ok(())
+}
